@@ -1,7 +1,17 @@
 {
     "rss_feeds": [
         "https://www.lemonde.fr/rss/une.xml",
-        "https://www.lemonde.fr/editoriaux/rss_full.xml"
+        "https://www.lemonde.fr/editoriaux/rss_full.xml",
+        "https://www.lemonde.fr/rss/en_continu.xml",
+        "https://www.lemonde.fr/biodiversite/rss_full.xml",
+        "https://www.lemonde.fr/faits-divers/rss_full.xml",
+        "https://www.lemonde.fr/idees/rss_full.xml",
+        "https://www.lemonde.fr/international/rss_full.xml",
+        "https://www.lemonde.fr/le-monde-et-vous/rss_full.xml",
+        "https://www.lemonde.fr/rss/plus-lus.xml",
+        "https://www.lemonde.fr/rss/plus-partages.xml",
+        "https://www.lemonde.fr/societe/rss_full.xml",
+        "https://www.lemonde.fr/tribunes/rss_full.xml"
     ]
 }
 
