@@ -1,0 +1,7 @@
+{
+    "rss_feeds": [
+        "https://www.lemonde.fr/rss/une.xml",
+        "https://www.lemonde.fr/editoriaux/rss_full.xml"
+    ]
+}
+
