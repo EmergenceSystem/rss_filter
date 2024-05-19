@@ -83,8 +83,7 @@ async fn generate_embryo_list(json_string: String) -> Vec<Embryo> {
     embryo_list
 }
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
+pub async fn start() -> std::io::Result<()> {
     match em_filter::find_port().await {
         Some(port) => {
             let filter_url = format!("http://localhost:{}/query", port);
