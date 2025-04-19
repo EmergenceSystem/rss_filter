@@ -1,18 +1,50 @@
+%%%-------------------------------------------------------------------
+%%% @doc This module handles the RSS filter application and acts as a Cowboy HTTP handler.
+%%% It reads an RSS configuration, processes incoming HTTP requests, and filters RSS feeds based on the request body.
+%%%
+%%% @end
+%%%-------------------------------------------------------------------
+
 -module(rss_filter_app).
 -behaviour(application).
 -behaviour(cowboy_handler).
 
 -include_lib("xmerl/include/xmerl.hrl").
 
+%%%-------------------------------------------------------------------
+%%% @doc Exported functions for the application and Cowboy handler behaviours.
+%%%
+%%% @end
+%%%-------------------------------------------------------------------
 -export([start/2, stop/1, init/2, terminate/3]).
 
+%%%-------------------------------------------------------------------
+%%% @doc Starts the application.
+%%% Finds the port and starts the supervisor link for the RSS filter.
+%%%
+%%% @spec start(start_type(), start_args()) -> {ok, port()}
+%%% @end
+%%%-------------------------------------------------------------------
 start(_StartType, _StartArgs) ->
     {ok, Port} = em_filter:find_port(),
     em_filter_sup:start_link(rss_filter, ?MODULE, Port).
 
+%%%-------------------------------------------------------------------
+%%% @doc Stops the application.
+%%%
+%%% @spec stop(state()) -> ok
+%%% @end
+%%%-------------------------------------------------------------------
 stop(_State) ->
     ok.
 
+%%%-------------------------------------------------------------------
+%%% @doc Initializes the Cowboy handler.
+%%% Reads the body of the incoming HTTP request, processes it, and generates a response.
+%%%
+%%% @spec init(cowboy_req:req(), state()) -> {ok, cowboy_req:req(), state()}
+%%% @end
+%%%-------------------------------------------------------------------
 init(Req0, State) ->
     {ok, Body, Req} = cowboy_req:read_body(Req0),
     io:format("Received body: ~p~n", [Body]),
@@ -26,9 +58,21 @@ init(Req0, State) ->
     ),
     {ok, Req2, State}.
 
+%%%-------------------------------------------------------------------
+%%% @doc Terminates the Cowboy handler.
+%%%
+%%% @spec terminate(reason(), cowboy_req:req(), state()) -> ok
+%%% @end
+%%%-------------------------------------------------------------------
 terminate(_Reason, _Req, _State) ->
     ok.
 
+%%%-------------------------------------------------------------------
+%%% @doc Reads the RSS configuration from a JSON file.
+%%%
+%%% @spec read_rss_config() -> {ok, [binary()]}
+%%% @end
+%%%-------------------------------------------------------------------
 read_rss_config() ->
     case file:read_file("rss_config.json") of
         {ok, Binary} ->
@@ -43,21 +87,35 @@ read_rss_config() ->
             {ok, []}
     end.
 
+%%%-------------------------------------------------------------------
+%%% @doc Generates a list of embryos based on the JSON body of the request.
+%%% Decodes the JSON body and initiates the search across RSS feeds.
+%%%
+%%% @spec generate_embryo_list(binary()) -> [map()]
+%%% @end
+%%%-------------------------------------------------------------------
 generate_embryo_list(JsonBinary) ->
     case jsone:decode(JsonBinary, [{keys, atom}]) of
         Search when is_map(Search) ->
             Value = string:lowercase(binary_to_list(maps:get(value, Search, <<"">>))),
             Timeout = list_to_integer(binary_to_list(maps:get(timeout, Search, <<"10">>))),
-            
+
             {ok, RssFeeds} = read_rss_config(),
             StartTime = erlang:system_time(millisecond),
-            
+
             search_feeds(RssFeeds, Value, StartTime, Timeout * 1000, []);
         {error, Reason} ->
             io:format("Error decoding JSON: ~p~n", [Reason]),
             []
     end.
 
+%%%-------------------------------------------------------------------
+%%% @doc Searches the RSS feeds for items matching the search criteria.
+%%% Iterates over the RSS feeds, fetches the feed data, and processes the items.
+%%%
+%%% @spec search_feeds([binary()], binary(), integer(), integer(), [map()]) -> [map()]
+%%% @end
+%%%-------------------------------------------------------------------
 search_feeds([], _SearchValue, _StartTime, _TimeoutMs, Acc) ->
     lists:reverse(Acc);
 search_feeds([FeedUrl | Rest], SearchValue, StartTime, TimeoutMs, Acc) ->
@@ -83,6 +141,13 @@ search_feeds([FeedUrl | Rest], SearchValue, StartTime, TimeoutMs, Acc) ->
             end
     end.
 
+%%%-------------------------------------------------------------------
+%%% @doc Processes individual RSS feed items.
+%%% Checks if the items match the search criteria and adds them to the accumulator if they do.
+%%%
+%%% @spec process_feed_items([xml()], binary(), integer(), integer(), [map()]) -> [map()]
+%%% @end
+%%%-------------------------------------------------------------------
 process_feed_items([], _SearchValue, _StartTime, _TimeoutMs, Acc) ->
     Acc;
 process_feed_items([Item | Rest], SearchValue, StartTime, TimeoutMs, Acc) ->
@@ -94,12 +159,12 @@ process_feed_items([Item | Rest], SearchValue, StartTime, TimeoutMs, Acc) ->
             Title = extract_element_text(xmerl_xpath:string("./title/text()", Item)),
             Link = extract_element_text(xmerl_xpath:string("./link/text()", Item)),
             Description = extract_element_text(xmerl_xpath:string("./description/text()", Item)),
-            
+
             LowerTitle = string:lowercase(Title),
             LowerLink = string:lowercase(Link),
             LowerDescription = string:lowercase(Description),
-            
-            NewAcc = case string:str(LowerTitle, SearchValue) > 0 orelse 
+
+            NewAcc = case string:str(LowerTitle, SearchValue) > 0 orelse
                          string:str(LowerLink, SearchValue) > 0 orelse
                          string:str(LowerDescription, SearchValue) > 0 of
                 true ->
@@ -116,6 +181,12 @@ process_feed_items([Item | Rest], SearchValue, StartTime, TimeoutMs, Acc) ->
             process_feed_items(Rest, SearchValue, StartTime, TimeoutMs, NewAcc)
     end.
 
+%%%-------------------------------------------------------------------
+%%% @doc Extracts text from XML elements.
+%%%
+%%% @spec extract_element_text([xml()]) -> binary()
+%%% @end
+%%%-------------------------------------------------------------------
 extract_element_text([]) ->
     "";
 extract_element_text([Element | _]) ->
@@ -125,3 +196,4 @@ extract_element_text([Element | _]) ->
         _ ->
             ""
     end.
+
