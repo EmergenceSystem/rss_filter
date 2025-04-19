@@ -1,0 +1,16 @@
+{application, rss_filter, [
+    {description, "em_filter lib to handle RSS"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {rss_filter_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        xmerl,
+        em_filter
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/EmergenceSystem/rss_filter"}]}
+]}.
