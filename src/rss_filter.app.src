@@ -1,6 +1,6 @@
 {application, rss_filter, [
     {description, "em_filter lib to handle RSS"},
-    {vsn, "0.1.2"},
+    {vsn, "0.1.3"},
     {registered, []},
     {mod, {rss_filter_app, []}},
     {applications, [
