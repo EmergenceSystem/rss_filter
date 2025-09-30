@@ -1,16 +1,18 @@
 %%%-------------------------------------------------------------------
-%%% @doc Module handling the RSS filter application and acting as a Cowboy HTTP handler.
-%%% It reads an RSS configuration, processes incoming HTTP requests, and filters RSS feeds based on the request body.
+%%% @doc Module handling the RSS filter application.
+%%% It reads an RSS configuration, processes incoming HTTP requests, 
+%%% and filters RSS feeds based on the request body.
 %%%
+%%% This module implements the handler interface expected by em_filter.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(rss_filter_app).
 -behaviour(application).
--behaviour(cowboy_handler).
 
 -include_lib("xmerl/include/xmerl.hrl").
 
--export([start/2, stop/1, init/2, terminate/3]).
+-export([start/2, stop/1]).
+-export([handle/1]). % Handler function for em_filter
 
 %%%-------------------------------------------------------------------
 %%% Application Callback Functions
@@ -23,21 +25,25 @@ start(_StartType, _StartArgs) ->
 stop(_State) ->
     ok.
 
-init(Req0, State) ->
-    {ok, Body, Req} = cowboy_req:read_body(Req0),
-    io:format("Received body: ~p~n", [Body]),
-    EmbryoList = generate_embryo_list(Body),
-    Response = #{embryo_list => EmbryoList},
-    EncodedResponse = jsone:encode(Response),
-    Req2 = cowboy_req:reply(200,
-        #{<<"content-type">> => <<"application/json">>},
-        EncodedResponse,
-        Req
-    ),
-    {ok, Req2, State}.
+%%%-------------------------------------------------------------------
+%%% Handler Function (called by em_filter_server via Wade)
+%%%-------------------------------------------------------------------
 
-terminate(_Reason, _Req, _State) ->
-    ok.
+%% @doc Handle incoming requests from the filter server.
+%% This function is called by em_filter_server through Wade.
+%% @param Body The request body (JSON binary or string)
+%% @return JSON response as binary or string
+handle(Body) when is_binary(Body) ->
+    handle(binary_to_list(Body));
+
+handle(Body) when is_list(Body) ->
+    io:format("RSS Filter received body: ~p~n", [Body]),
+    EmbryoList = generate_embryo_list(list_to_binary(Body)),
+    Response = #{embryo_list => EmbryoList},
+    jsone:encode(Response);
+
+handle(_) ->
+    jsone:encode(#{error => <<"Invalid request body">>}).
 
 %%%-------------------------------------------------------------------
 %%% RSS Configuration Functions
