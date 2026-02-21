@@ -1,9 +1,12 @@
 %%%-------------------------------------------------------------------
-%%% @doc Module handling the RSS filter application.
-%%% It reads an RSS configuration, processes incoming HTTP requests, 
-%%% and filters RSS feeds based on the request body.
+%%% @doc RSS feed search filter.
 %%%
-%%% This module implements the handler interface expected by em_filter.
+%%% Reads a list of RSS feed URLs from rss_config.json, fetches each
+%%% feed, and returns items whose title, link or description matches
+%%% the search query.
+%%%
+%%% rss_config.json format:
+%%%   { "rss_feeds": ["https://example.com/feed.rss", ...] }
 %%% @end
 %%%-------------------------------------------------------------------
 -module(rss_filter_app).
@@ -12,142 +15,132 @@
 -include_lib("xmerl/include/xmerl.hrl").
 
 -export([start/2, stop/1]).
--export([handle/1]). % Handler function for em_filter
+-export([handle/1]).
 
-%%%-------------------------------------------------------------------
-%%% Application Callback Functions
-%%%-------------------------------------------------------------------
+%%====================================================================
+%% Application behaviour
+%%====================================================================
 
 start(_StartType, _StartArgs) ->
-    {ok, Port} = em_filter:find_port(),
-    em_filter_sup:start_link(rss_filter, ?MODULE, Port).
+    em_filter:start_filter(rss_filter, ?MODULE).
 
 stop(_State) ->
-    ok.
+    em_filter:stop_filter(rss_filter).
 
-%%%-------------------------------------------------------------------
-%%% Handler Function (called by em_filter_server via Wade)
-%%%-------------------------------------------------------------------
+%%====================================================================
+%% Filter handler — returns a list of embryo maps
+%%====================================================================
 
-%% @doc Handle incoming requests from the filter server.
-%% This function is called by em_filter_server through Wade.
-%% @param Body The request body (JSON binary or string)
-%% @return JSON response as binary or string
 handle(Body) when is_binary(Body) ->
-    handle(binary_to_list(Body));
-
-handle(Body) when is_list(Body) ->
-    io:format("RSS Filter received body: ~p~n", [Body]),
-    EmbryoList = generate_embryo_list(list_to_binary(Body)),
-    Response = #{embryo_list => EmbryoList},
-    jsone:encode(Response);
-
+    generate_embryo_list(Body);
 handle(_) ->
-    jsone:encode(#{error => <<"Invalid request body">>}).
+    [].
 
-%%%-------------------------------------------------------------------
-%%% RSS Configuration Functions
-%%%-------------------------------------------------------------------
+%%====================================================================
+%% Search and processing
+%%====================================================================
+
+generate_embryo_list(JsonBinary) ->
+    {Value, Timeout} = extract_params(JsonBinary),
+    Feeds     = read_rss_config(),
+    StartTime = erlang:system_time(millisecond),
+    search_feeds(Feeds, string:lowercase(Value), StartTime, Timeout * 1000, []).
+
+extract_params(JsonBinary) ->
+    try json:decode(JsonBinary) of
+        Map when is_map(Map) ->
+            Value   = binary_to_list(maps:get(<<"value">>,   Map, <<"">>)),
+            Timeout = case maps:get(<<"timeout">>, Map, undefined) of
+                undefined            -> 10;
+                T when is_integer(T) -> T;
+                T when is_binary(T)  -> binary_to_integer(T)
+            end,
+            {Value, Timeout};
+        _ ->
+            {binary_to_list(JsonBinary), 10}
+    catch
+        _:_ -> {binary_to_list(JsonBinary), 10}
+    end.
+
+%%--------------------------------------------------------------------
+%% Config
+%%--------------------------------------------------------------------
 
 read_rss_config() ->
     case file:read_file("rss_config.json") of
-        {ok, Binary} ->
-            case jsone:decode(Binary) of
-                #{<<"rss_feeds">> := RssFeeds} when is_list(RssFeeds) ->
-                    {ok, RssFeeds};
-                _ ->
-                    {ok, []}
-            end;
-        {error, Reason} ->
-            io:format("Error reading RSS config: ~p~n", [Reason]),
-            {ok, []}
+        {ok, Bin} ->
+            try json:decode(Bin) of
+                #{<<"rss_feeds">> := Feeds} when is_list(Feeds) -> Feeds;
+                _ -> []
+            catch _:_ -> [] end;
+        _ -> []
     end.
 
-%%%-------------------------------------------------------------------
-%%% Feed Processing Functions
-%%%-------------------------------------------------------------------
+%%--------------------------------------------------------------------
+%% Feed iteration
+%%--------------------------------------------------------------------
 
-generate_embryo_list(JsonBinary) ->
-    case jsone:decode(JsonBinary, [{keys, atom}]) of
-        Search when is_map(Search) ->
-            Value = string:lowercase(binary_to_list(maps:get(value, Search, <<"">>))),
-            Timeout = list_to_integer(binary_to_list(maps:get(timeout, Search, <<"10">>))),
-
-            {ok, RssFeeds} = read_rss_config(),
-            StartTime = erlang:system_time(millisecond),
-
-            search_feeds(RssFeeds, Value, StartTime, Timeout * 1000, []);
-        {error, Reason} ->
-            io:format("Error decoding JSON: ~p~n", [Reason]),
-            []
-    end.
-
-search_feeds([], _SearchValue, _StartTime, _TimeoutMs, Acc) ->
+search_feeds([], _Query, _Start, _Timeout, Acc) ->
     lists:reverse(Acc);
-
-search_feeds([FeedUrl | Rest], SearchValue, StartTime, TimeoutMs, Acc) ->
-    CurrentTime = erlang:system_time(millisecond),
-    case CurrentTime - StartTime >= TimeoutMs of
-        true ->
-            lists:reverse(Acc);
+search_feeds([FeedUrl | Rest], Query, Start, Timeout, Acc) ->
+    case erlang:system_time(millisecond) - Start >= Timeout of
+        true  -> lists:reverse(Acc);
         false ->
-            case httpc:request(get, {binary_to_list(FeedUrl), []}, [{timeout, 5000}], [{body_format, binary}]) of
-                {ok, {{_, 200, _}, _, Body}} ->
-                    case xmerl_scan:string(binary_to_list(Body)) of
-                        {RssDoc, _} ->
-                            Items = xmerl_xpath:string("//item", RssDoc),
-                            NewAcc = process_feed_items(Items, SearchValue, StartTime, TimeoutMs, Acc),
-                            search_feeds(Rest, SearchValue, StartTime, TimeoutMs, NewAcc);
-                        _ ->
-                            io:format("Failed to parse RSS XML~n"),
-                            search_feeds(Rest, SearchValue, StartTime, TimeoutMs, Acc)
-                    end;
-                {error, Reason} ->
-                    io:format("Error fetching RSS feed: ~p~n", [Reason]),
-                    search_feeds(Rest, SearchValue, StartTime, TimeoutMs, Acc)
-            end
+            NewAcc = fetch_and_filter_feed(FeedUrl, Query, Start, Timeout, Acc),
+            search_feeds(Rest, Query, Start, Timeout, NewAcc)
     end.
 
-process_feed_items([], _SearchValue, _StartTime, _TimeoutMs, Acc) ->
-    Acc;
-
-process_feed_items([Item | Rest], SearchValue, StartTime, TimeoutMs, Acc) ->
-    CurrentTime = erlang:system_time(millisecond),
-    case CurrentTime - StartTime >= TimeoutMs of
-        true ->
-            Acc;
-        false ->
-            Title = extract_element_text(xmerl_xpath:string("./title/text()", Item)),
-            Link = extract_element_text(xmerl_xpath:string("./link/text()", Item)),
-            Description = extract_element_text(xmerl_xpath:string("./description/text()", Item)),
-
-            LowerTitle = string:lowercase(Title),
-            LowerLink = string:lowercase(Link),
-            LowerDescription = string:lowercase(Description),
-
-            NewAcc = case string:str(LowerTitle, SearchValue) > 0 orelse
-                         string:str(LowerLink, SearchValue) > 0 orelse
-                         string:str(LowerDescription, SearchValue) > 0 of
-                true ->
-                    Embryo = #{
-                        properties => #{
-                            <<"url">> => list_to_binary(Link),
-                            <<"resume">> => unicode:characters_to_binary(Description)
-                        }
-                    },
-                    [Embryo | Acc];
-                false ->
+fetch_and_filter_feed(FeedUrl, Query, Start, Timeout, Acc) ->
+    Url = binary_to_list(FeedUrl),
+    case httpc:request(get, {Url, []}, [{timeout, 5000}], [{body_format, binary}]) of
+        {ok, {{_, 200, _}, _, Body}} ->
+            case xmerl_scan:string(binary_to_list(Body)) of
+                {Doc, _} ->
+                    Items = xmerl_xpath:string("//item", Doc),
+                    process_feed_items(Items, Query, Start, Timeout, Acc);
+                _ ->
                     Acc
-            end,
-            process_feed_items(Rest, SearchValue, StartTime, TimeoutMs, NewAcc)
+            end;
+        _ ->
+            Acc
     end.
 
-extract_element_text([]) ->
-    "";
-extract_element_text([Element | _]) ->
-    case Element of
-        #xmlText{value = Value} ->
-            Value;
-        _ ->
-            ""
+%%--------------------------------------------------------------------
+%% Item processing
+%%--------------------------------------------------------------------
+
+process_feed_items([], _Query, _Start, _Timeout, Acc) ->
+    Acc;
+process_feed_items([Item | Rest], Query, Start, Timeout, Acc) ->
+    case erlang:system_time(millisecond) - Start >= Timeout of
+        true  -> Acc;
+        false ->
+            NewAcc = case process_item(Item, Query) of
+                {ok, Embryo} -> [Embryo | Acc];
+                skip         -> Acc
+            end,
+            process_feed_items(Rest, Query, Start, Timeout, NewAcc)
     end.
+
+process_item(Item, Query) ->
+    Title = xml_text(xmerl_xpath:string("./title/text()",       Item)),
+    Link  = xml_text(xmerl_xpath:string("./link/text()",        Item)),
+    Desc  = xml_text(xmerl_xpath:string("./description/text()", Item)),
+    Matches =
+        string:str(string:lowercase(Title), Query) > 0 orelse
+        string:str(string:lowercase(Link),  Query) > 0 orelse
+        string:str(string:lowercase(Desc),  Query) > 0,
+    case Matches of
+        true ->
+            {ok, #{
+                <<"properties">> => #{
+                    <<"url">>    => list_to_binary(Link),
+                    <<"resume">> => unicode:characters_to_binary(Desc)
+                }
+            }};
+        false ->
+            skip
+    end.
+
+xml_text([#xmlText{value = V} | _]) -> V;
+xml_text(_)                          -> "".
