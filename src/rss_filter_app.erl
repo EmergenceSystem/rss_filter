@@ -1,12 +1,18 @@
 %%%-------------------------------------------------------------------
-%%% @doc RSS feed search filter.
+%%% @doc RSS feed search agent.
 %%%
 %%% Reads a list of RSS feed URLs from rss_config.json, fetches each
 %%% feed, and returns items whose title, link or description matches
 %%% the search query.
 %%%
+%%% Maintains a memory of URLs already returned so duplicate items
+%%% across successive queries are filtered out.
+%%%
 %%% rss_config.json format:
 %%%   { "rss_feeds": ["https://example.com/feed.rss", ...] }
+%%%
+%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
+%%% Memory schema: `#{seen => #{binary_url => true}}'.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(rss_filter_app).
@@ -15,26 +21,42 @@
 -include_lib("xmerl/include/xmerl.hrl").
 
 -export([start/2, stop/1]).
--export([handle/1]).
+-export([handle/2]).
+
+-define(CAPABILITIES, [
+    <<"rss">>,
+    <<"feeds">>,
+    <<"news">>
+]).
 
 %%====================================================================
 %% Application behaviour
 %%====================================================================
 
 start(_StartType, _StartArgs) ->
-    em_filter:start_filter(rss_filter, ?MODULE).
+    em_filter:start_agent(rss_filter, ?MODULE, #{
+        capabilities => ?CAPABILITIES,
+        memory       => ets
+    }).
 
 stop(_State) ->
-    em_filter:stop_filter(rss_filter).
+    em_filter:stop_agent(rss_filter).
 
 %%====================================================================
-%% Filter handler — returns a list of embryo maps
+%% Agent handler
 %%====================================================================
 
-handle(Body) when is_binary(Body) ->
-    generate_embryo_list(Body);
-handle(_) ->
-    [].
+handle(Body, Memory) when is_binary(Body) ->
+    Seen    = maps:get(seen, Memory, #{}),
+    Embryos = generate_embryo_list(Body),
+    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
+    NewSeen = lists:foldl(fun(E, Acc) ->
+        Acc#{url_of(E) => true}
+    end, Seen, Fresh),
+    {Fresh, Memory#{seen => NewSeen}};
+
+handle(_Body, Memory) ->
+    {[], Memory}.
 
 %%====================================================================
 %% Search and processing
@@ -144,3 +166,11 @@ process_item(Item, Query) ->
 
 xml_text([#xmlText{value = V} | _]) -> V;
 xml_text(_)                          -> "".
+
+%%====================================================================
+%% Internal helpers
+%%====================================================================
+
+-spec url_of(map()) -> binary().
+url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
+url_of(_) -> <<>>.
