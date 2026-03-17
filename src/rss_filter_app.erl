@@ -5,14 +5,17 @@
 %%% feed, and returns items whose title, link or description matches
 %%% the search query.
 %%%
-%%% Maintains a memory of URLs already returned so duplicate items
-%%% across successive queries are filtered out.
+%%% Deduplication by URL is handled upstream by the Emquest pipeline.
+%%%
+%%% === Capability cascade ===
+%%%
+%%%   base_capabilities/0 extends em_filter:base_capabilities().
+%%%   Site-specific filters extend rss_filter_app:base_capabilities():
 %%%
 %%% rss_config.json format:
 %%%   { "rss_feeds": ["https://example.com/feed.rss", ...] }
 %%%
-%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
-%%% Memory schema: `#{seen => #{binary_url => true}}'.
+%%% Handler contract: handle/2 (Body, Memory) -> {RawList, Memory}.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(rss_filter_app).
@@ -21,13 +24,15 @@
 -include_lib("xmerl/include/xmerl.hrl").
 
 -export([start/2, stop/1]).
--export([handle/2]).
+-export([handle/2, base_capabilities/0]).
 
--define(CAPABILITIES, [
-    <<"rss">>,
-    <<"feeds">>,
-    <<"news">>
-]).
+%%====================================================================
+%% Capability cascade
+%%====================================================================
+
+-spec base_capabilities() -> [binary()].
+base_capabilities() ->
+    em_filter:base_capabilities() ++ [<<"rss">>, <<"feeds">>, <<"news">>].
 
 %%====================================================================
 %% Application behaviour
@@ -35,8 +40,7 @@
 
 start(_StartType, _StartArgs) ->
     em_filter:start_agent(rss_filter, ?MODULE, #{
-        capabilities => ?CAPABILITIES,
-        memory       => ets
+        capabilities => base_capabilities()
     }).
 
 stop(_State) ->
@@ -47,14 +51,7 @@ stop(_State) ->
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
-    Seen    = maps:get(seen, Memory, #{}),
-    Embryos = generate_embryo_list(Body),
-    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
-    NewSeen = lists:foldl(fun(E, Acc) ->
-        Acc#{url_of(E) => true}
-    end, Seen, Fresh),
-    {Fresh, Memory#{seen => NewSeen}};
-
+    {generate_embryo_list(Body), Memory};
 handle(_Body, Memory) ->
     {[], Memory}.
 
@@ -71,7 +68,8 @@ generate_embryo_list(JsonBinary) ->
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
         Map when is_map(Map) ->
-            Value   = binary_to_list(maps:get(<<"value">>,   Map, <<"">>)),
+            Value   = binary_to_list(maps:get(<<"value">>, Map,
+                          maps:get(<<"query">>, Map, <<"">>))),
             Timeout = case maps:get(<<"timeout">>, Map, undefined) of
                 undefined            -> 10;
                 T when is_integer(T) -> T;
@@ -166,11 +164,3 @@ process_item(Item, Query) ->
 
 xml_text([#xmlText{value = V} | _]) -> V;
 xml_text(_)                          -> "".
-
-%%====================================================================
-%% Internal helpers
-%%====================================================================
-
--spec url_of(map()) -> binary().
-url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
-url_of(_) -> <<>>.
