@@ -41,7 +41,8 @@ base_capabilities() ->
 start(_StartType, _StartArgs) ->
     em_filter:start_agent(rss_filter, ?MODULE, #{
         capabilities => base_capabilities()
-    }).
+    }),
+    {ok, self()}.
 
 stop(_State) ->
     em_filter:stop_agent(rss_filter).
