@@ -1,6 +1,6 @@
 {application, rss_filter, [
     {description, "em_filter lib to handle RSS"},
-    {vsn, "0.6.7"},
+    {vsn, "0.6.8"},
     {registered, []},
     {applications, [
         kernel,
