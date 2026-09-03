@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Allow the publish job to push a tag, and the downstream job to open PRs.
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  OTP_VERSION: "28"
+  REBAR3_VERSION: "3.25.0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Always: compile + run the full test suite on every push and PR.
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+
+      # sied / kvex are native (Rust) NIF deps; the runner needs a C + Rust
+      # toolchain to build them from the hex source packages.
+      - name: Install NIF build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache rebar3 deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: ${{ runner.os }}-rebar3-${{ hashFiles('rebar.lock', 'rebar.config') }}
+          restore-keys: ${{ runner.os }}-rebar3-
+
+      - run: rebar3 compile
+      - run: rebar3 eunit
+      - run: rebar3 ct
+
+  # ---------------------------------------------------------------------------
+  # On push to main only: if this commit changed the app version, dry-run then
+  # publish to hex and tag the release. Skips silently when the version is
+  # unchanged.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      bumped: ${{ steps.ver.outputs.bumped }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: ver
+        name: Detect publishable version
+        run: |
+          cur=$(grep -oP '\{vsn,\s*"\K[0-9.]+' src/rss_filter.app.src | head -1)
+          echo "version=$cur" >> "$GITHUB_OUTPUT"
+          if [ -z "$cur" ]; then
+            echo "bumped=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://hex.pm/api/packages/rss_filter/releases/$cur")
+          if [ "$code" = "200" ]; then
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::rss_filter $cur already on hex; nothing to publish"
+          else
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::rss_filter $cur not on hex; publishing"
+          fi
+
+      - uses: erlef/setup-beam@v1
+        if: steps.ver.outputs.bumped == 'true'
+        with:
+          otp-version: '27'   # rebar3_hex is happiest on <=27
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+
+      # sied's own rebar.config ships no rebar3_hex plugin; enable it globally
+      # (runner-only, never in the package). Harmless for rss_filter too.
+      - name: Enable rebar3_hex (global, not shipped)
+        if: steps.ver.outputs.bumped == 'true'
+        run: |
+          mkdir -p ~/.config/rebar3
+          echo '{plugins, [{rebar3_hex, "7.0.6"}]}.' > ~/.config/rebar3/rebar.config
+
+      # rebar3_hex 7.0.6 does NOT read HEX_API_KEY on the publish/write path
+      # (only merge_with_env, which publish bypasses). Write the api_key straight
+      # into the hex auth config so hex_config_write uses it directly (no local
+      # password). The key MUST have api write permission.
+      - name: Configure hex auth
+        if: steps.ver.outputs.bumped == 'true'
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: |
+          printf '#{<<"hexpm">> => #{api_key => <<"%s">>}}.\n' "$HEX_API_KEY" > ~/.config/rebar3/hex.config
+
+      - name: Publish to hex
+        if: steps.ver.outputs.bumped == 'true'
+        run: rebar3 hex publish package --yes
+
+      - name: Tag release
+        if: steps.ver.outputs.bumped == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "v${{ steps.ver.outputs.version }}" || exit 0
+          git push origin "v${{ steps.ver.outputs.version }}" || true
+
+  downstream:
+    needs: publish
+    if: needs.publish.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open bump PRs across the org
+        env:
+          GH_TOKEN: ${{ secrets.ORG_PAT }}
+          VER: ${{ needs.publish.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::ORG_PAT secret not set; skipping downstream bump PRs"
+            exit 0
+          fi
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          repos=$(gh repo list EmergenceSystem --limit 500 --no-archived --json name -q '.[].name' | grep -E '_filter$' || true)
+          echo "Candidate repos:"; echo "$repos"
+
+          for repo in $repos; do
+            full="EmergenceSystem/$repo"
+            # Read the repo's rebar.config; skip if absent or no rss_filter dep.
+            cfg=$(gh api "repos/$full/contents/rebar.config" -q '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
+            if [ -z "$cfg" ] || ! echo "$cfg" | grep -q 'rss_filter'; then
+              echo "skip $repo (no rss_filter dep)"; continue
+            fi
+            cur=$(echo "$cfg" | grep -oP '\{rss_filter,\s*"\K[0-9.]+' | head -1 || true)
+            if [ "$cur" = "$VER" ]; then
+              echo "skip $repo (already $VER)"; continue
+            fi
+
+            tmp=$(mktemp -d)
+            if ! git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${full}.git" "$tmp" 2>/dev/null; then
+              echo "::warning::clone failed for $repo"; rm -rf "$tmp"; continue
+            fi
+            (
+              cd "$tmp"
+              branch="chore/bump-rss_filter-${VER}"
+              git checkout -B "$branch"
+              sed -i -E "s/(\{rss_filter,[[:space:]]*\")[0-9.]+(\")/\1${VER}\2/" rebar.config
+              if git diff --quiet; then echo "no change in $repo"; exit 0; fi
+              git commit -am "chore: bump rss_filter to ${VER}"
+              git push -f origin "$branch"
+              gh pr create --repo "$full" --head "$branch" --base main \
+                --title "chore: bump rss_filter to ${VER}" \
+                --body "Automated bump of the rss_filter dependency to ${VER}, published from EmergenceSystem/rss_filter CI." \
+                2>/dev/null || echo "PR already exists for $repo"
+            ) || echo "::warning::bump failed for $repo"
+            rm -rf "$tmp"
+          done
