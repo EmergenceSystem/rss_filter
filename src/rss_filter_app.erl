@@ -22,7 +22,7 @@
 
 -include_lib("xmerl/include/xmerl.hrl").
 
--export([handle/2, base_capabilities/0]).
+-export([handle/2, base_capabilities/0, sanitize_xml/1, scan_feed/1]).
 
 %%====================================================================
 %% Capability cascade
@@ -100,15 +100,41 @@ fetch_and_filter_feed(FeedUrl, Query, Start, Timeout, Acc) ->
     Url = binary_to_list(FeedUrl),
     case httpc:request(get, {Url, []}, [{timeout, 5000}], [{body_format, binary}]) of
         {ok, {{_, 200, _}, _, Body}} ->
-            case xmerl_scan:string(binary_to_list(Body)) of
-                {Doc, _} ->
-                    Items = xmerl_xpath:string("//item", Doc),
+            case scan_feed(Body) of
+                {ok, Items} ->
                     process_feed_items(Items, Query, Start, Timeout, Acc);
-                _ ->
+                {error, _} ->
                     Acc
             end;
         _ ->
             Acc
+    end.
+
+%%--------------------------------------------------------------------
+%% XML parsing (robust to real-world feeds)
+%%--------------------------------------------------------------------
+
+%% @doc Escape any `&' that does not start a valid XML entity or character
+%% reference, so feeds carrying bare ampersands or undeclared HTML entities
+%% (e.g. `&nbsp;') do not blow up xmerl with error_scanning_entity_ref.
+-spec sanitize_xml(binary() | string()) -> string().
+sanitize_xml(Bin) when is_binary(Bin) -> sanitize_xml(binary_to_list(Bin));
+sanitize_xml(S) when is_list(S) ->
+    re:replace(S,
+               "&(?!(?:#[0-9]+|#x[0-9a-fA-F]+|amp|lt|gt|quot|apos);)",
+               "\\&amp;",
+               [global, {return, list}]).
+
+%% @doc Parse a feed body into its `item' elements, sanitising first and
+%% never crashing: any scan failure yields `{error, parse_failed}'.
+-spec scan_feed(binary() | string()) -> {ok, list()} | {error, term()}.
+scan_feed(Body) ->
+    try xmerl_scan:string(sanitize_xml(Body)) of
+        {Doc, _} -> {ok, xmerl_xpath:string("//item", Doc)}
+    catch
+        Class:Reason ->
+            logger:warning("[rss_filter] feed parse failed: ~p:~p", [Class, Reason]),
+            {error, parse_failed}
     end.
 
 %%--------------------------------------------------------------------
